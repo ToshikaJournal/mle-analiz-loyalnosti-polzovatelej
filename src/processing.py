@@ -137,6 +137,9 @@ class DataProcessor:
         
         user_profile = user_profile.merge(first_order, on='user_id', how='left')
         user_profile['is_two'] = (user_profile['total_orders'] >= 2).astype(int)
+        user_profile['first_day_of_week'] = pd.to_datetime(user_profile['first_order_dt']).dt.dayofweek
+        day_names = {0: 'Пн', 1: 'Вт', 2: 'Ср', 3: 'Чт', 4: 'Пт', 5: 'Сб', 6: 'Вс'}
+        user_profile['first_day_name'] = user_profile['first_day_of_week'].map(day_names)
         
         # Фильтрация аномальных профилей (>99 перцентиля заказов или <= 0 выручка)
         q99_orders = user_profile['total_orders'].quantile(0.99)
@@ -164,7 +167,21 @@ class DataProcessor:
             total_users=('user_id', 'count'), returned_users=('is_two', 'sum')
         ).reset_index()
         self.device_stats['return_rate'] = self.device_stats['returned_users'] / self.device_stats['total_users']
+        # Статистика по регионам
+        self.region_stats = self.user_profiles.groupby('first_region').agg(
+            total_users=('user_id', 'count'), returned_users=('is_two', 'sum')
+        ).reset_index()
+        self.region_stats = self.region_stats.sort_values('total_users', ascending=False).head(10)
+        self.region_stats['return_rate'] = self.region_stats['returned_users'] / self.region_stats['total_users']
         
+        # Статистика по дням недели
+        self.dow_stats = self.user_profiles.groupby('first_day_name').agg(
+            total_users=('user_id', 'count'), returned_users=('is_two', 'sum')
+        ).reset_index()
+        day_order = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+        self.dow_stats['first_day_name'] = pd.Categorical(self.dow_stats['first_day_name'], categories=day_order, ordered=True)
+        self.dow_stats = self.dow_stats.sort_values('first_day_name')
+        self.dow_stats['return_rate'] = self.dow_stats['returned_users'] / self.dow_stats['total_users']
         print("Расчёты удержания завершены.")
 
     def correlation_analysis(self):
@@ -192,6 +209,44 @@ class DataProcessor:
         self.corr_5plus = corr_matrix['total_orders'].drop('total_orders').sort_values(ascending=False)
         print("Корреляционный анализ завершён.")
 
+    def check_hypotheses(self):
+        # Проверка двух продуктовых гипотез.
+        print("Проверка продуктовых гипотез.")
+        
+        # Гипотеза 1: Спорт vs Концерты
+        sport_return = self.user_profiles[self.user_profiles['first_event_type'] == 'Спорт']['is_two'].mean()
+        concert_return = self.user_profiles[self.user_profiles['first_event_type'] == 'Концерты']['is_two'].mean()
+        sport_count = self.user_profiles[self.user_profiles['first_event_type'] == 'Спорт'].shape[0]
+        concert_count = self.user_profiles[self.user_profiles['first_event_type'] == 'Концерты'].shape[0]
+        
+        self.hypothesis_1 = {
+            'sport_return': sport_return,
+            'concert_return': concert_return,
+            'sport_count': sport_count,
+            'concert_count': concert_count
+        }
+        print(f"   Гипотеза 1 (На Спорте возвратов больше, чем на Концерты): Спорт — {sport_return:.1%} ({sport_count} чел.), Концерты — {concert_return:.1%} ({concert_count} чел.)")
+        
+        # Гипотеза 2: ТОП-3 региона vs остальные
+        top3_regions = self.user_profiles['first_region'].value_counts().head(3).index.tolist()
+        self.user_profiles['is_top3_region'] = self.user_profiles['first_region'].isin(top3_regions)
+        
+        top3_return = self.user_profiles[self.user_profiles['is_top3_region']]['is_two'].mean()
+        other_return = self.user_profiles[~self.user_profiles['is_top3_region']]['is_two'].mean()
+        top3_count = self.user_profiles[self.user_profiles['is_top3_region']].shape[0]
+        other_count = self.user_profiles[~self.user_profiles['is_top3_region']].shape[0]
+        other_n_regions = self.user_profiles[~self.user_profiles['is_top3_region']]['first_region'].nunique()
+        
+        self.hypothesis_2 = {
+            'top3_return': top3_return,
+            'other_return': other_return,
+            'top3_count': top3_count,
+            'other_count': other_count,
+            'other_n_regions': other_n_regions,
+            'top3_regions': top3_regions
+        }
+        print(f"   Гипотеза 2 (В ТОП-3 регионах по количеству пользователей доля возвратов выше): ТОП-3 ({', '.join(top3_regions)}) — {top3_return:.1%} ({top3_count} чел.), Остальные ({other_n_regions} регионов) — {other_return:.1%} ({other_count} чел.)")
+
     def generate_report(self):
         # Вывод краткого итогового отчёта в терминал.
         print()
@@ -213,7 +268,18 @@ class DataProcessor:
             print(f"   между регулярностью покупок и общим числом заказов (признак '{top_corr}', phi_k ≈ {self.corr_5plus.max():.3f}).")
         else:
             print("   между регулярностью покупок и общим числом заказов.")
-            
+        print()
+        print("АНАЛИЗ ПО РЕГИОНАМ И ДНЯМ НЕДЕЛИ:")
+        top_region = self.region_stats.loc[self.region_stats['return_rate'].idxmax()]
+        print(f"- Лучший регион: {top_region['first_region']} ({top_region['return_rate']:.1%}, {int(top_region['total_users'])} чел.)")
+        
+        top_day = self.dow_stats.loc[self.dow_stats['return_rate'].idxmax()]
+        print(f"- Лучший день недели: {top_day['first_day_name']} ({top_day['return_rate']:.1%}, {int(top_day['total_users'])} чел.)")
+        print()
+        print("ПРОВЕРКА ГИПОТЕЗ о доле возвратов:")
+        print(f"- Гипотеза 1 (Спорт vs Концерты): {'Подтвердилась' if self.hypothesis_1['sport_return'] > self.hypothesis_1['concert_return'] else 'Не подтвердилась'}")
+        print(f"- Гипотеза 2 (ТОП-3 региона): {'Подтвердилась' if self.hypothesis_2['top3_return'] > self.hypothesis_2['other_return'] else 'Не подтвердилась'}")    
+        print()
         print("РЕКОМЕНДАЦИИ:")
         print("   - Внедрить персональные скидки на второй заказ сразу после первой покупки.")
         print("   - Увеличить продвижение категорий 'Выставки' и 'Театр' как каналов привлечения.")
@@ -228,4 +294,5 @@ class DataProcessor:
         self.build_user_profiles()
         self.calculate_retention()
         self.correlation_analysis()
+        self.check_hypotheses()
         self.generate_report()
